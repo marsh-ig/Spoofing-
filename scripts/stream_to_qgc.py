@@ -14,11 +14,12 @@ from pymavlink import mavutil
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.sim.qgc_mavlink_bridge import QGCMavlinkBridge
-from src.sim.trajectory_generator import generate_reference_trajectory
+from src.sim.trajectory_generator import generate_flight
+from src.models.data_types import TrueState, IMUReading, GPSReading
 from src.sensors.imu_model import SyntheticIMU
 from src.sensors.gps_model import SyntheticGPS
-from src.filters.ekf_fusion import LooselyCoupledEKF
-from src.attacks.slam_frog_spoofer import SlamFrogSpoofer
+from src.filters.ekf_fusion import LooseCoupledEKF
+from src.attacks.slam_frog_spoofer import GPSSpoofer
 from src.control.maneuver_injector import MicroManeuverInjector
 from src.detection.layer1_passive import Layer1PassiveDetector
 from src.detection.layer3_active import Layer3ActiveTrap
@@ -36,14 +37,20 @@ def main():
     sim_duration = 60.0
     bridge = QGCMavlinkBridge(target_ip="127.0.0.1", target_port=14550, origin_lat=12.9716, origin_lon=77.5946, origin_alt=120.0)
     
-    t_axis, true_states = generate_reference_trajectory(duration=sim_duration, dt=dt_sim)
-    imu = SyntheticIMU(dt=dt_sim, seed=42)
-    gps = SyntheticGPS(dt=0.10, seed=42)
-    spoofer = SlamFrogSpoofer(attack_start_time=20.0, drift_accel=0.08)
+    df_raw = generate_flight(duration_sec=sim_duration, dt=dt_sim)
+    imu = SyntheticIMU()
+    gps = SyntheticGPS()
+    spoofer = GPSSpoofer(attack_type="slam_frog", start_time=20.0)
     injector = MicroManeuverInjector(probe_times=[35.0], duration=0.3, amplitude_deg=1.0)
-    ekf = LooselyCoupledEKF(dt_imu=dt_sim)
+    ekf = LooseCoupledEKF(dt=dt_sim)
     layer1 = Layer1PassiveDetector(chi2_threshold=22.46)
     trap = Layer3ActiveTrap(min_correlation=0.70, max_lag_sec=0.08)
+    
+    first_row = df_raw.iloc[0]
+    ekf.initialize_state(
+        initial_pos=np.array([first_row['pos_x'], first_row['pos_y'], -first_row['pos_z']]),
+        initial_vel=np.array([first_row['vel_x'], first_row['vel_y'], first_row['vel_z']])
+    )
     
     # State tracking
     is_spoofing = False
@@ -59,16 +66,26 @@ def main():
     bridge.send_heartbeat()
     bridge.send_statustext("AVIONICS: Autonomous Mission Armed. EKF Online.", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     
-    start_wall_time = time.time()
-    last_gps_time = 0.0
     last_hud_print = 0.0
     
     try:
-        for idx, (t, state) in enumerate(zip(t_axis, true_states)):
+        for idx, row in df_raw.iterrows():
             loop_start = time.time()
+            t = row['timestamp']
+            
+            true_pos = np.array([row['pos_x'], row['pos_y'], -row['pos_z']])
+            true_vel = np.array([row['vel_x'], row['vel_y'], row['vel_z']])
+            true_accel = np.array([row['imu_ax'], row['imu_ay'], row['imu_az'] + 9.81])
+            
+            true_state = TrueState(
+                timestamp=t,
+                position=true_pos,
+                velocity=true_vel,
+                acceleration=true_accel
+            )
             
             # 1. IMU Physics & Measurement
-            imu_meas = imu.measure(state)
+            imu_meas = imu.measure(true_state)
             
             # Check for active probe injection at t=35s
             probe_cmd = injector.get_probe_command(t)
@@ -76,24 +93,23 @@ def main():
                 is_probing = True
                 bridge.send_statustext("ACTION: Injecting 1 deg Active Micro-Maneuver Probe", mavutil.mavlink.MAV_SEVERITY_WARNING)
             
-            # IMU body acceleration (aerodynamic response included)
+            # IMU body lateral acceleration (aerodynamic response included)
             a_body = imu_meas.accel[1] + probe_cmd[0] * 65.0
             imu_accel_buf.append(a_body)
             
-            # EKF Predict step (100 Hz / 50 Hz)
-            ekf.predict(imu_meas.accel, imu_meas.gyro)
+            # EKF Predict step (50 Hz)
+            ekf.predict(imu_meas)
             
             # 2. GPS Measurement (10 Hz)
-            if t - last_gps_time >= 0.10:
-                last_gps_time = t
-                raw_gps = gps.measure(state)
+            if idx % 5 == 0:
+                raw_gps = gps.measure(true_state)
                 
                 # Apply attack after t=20s
                 if t >= 20.0 and not is_spoofing:
                     is_spoofing = True
                     bridge.send_statustext("WARN: GPS Spoofing Drift Initiated (Slam-Frog sub-noise)", mavutil.mavlink.MAV_SEVERITY_WARNING)
                     
-                spoofed_gps = spoofer.modify_gps(raw_gps, t)
+                spoofed_gps = spoofer.inject_spoofing(raw_gps)
                 
                 # Active GPS Acceleration response
                 if is_spoofing and not is_gps_rejected:
@@ -105,8 +121,8 @@ def main():
                 
                 # EKF Update step (if GPS not yet isolated by supervisor)
                 if not is_gps_rejected:
-                    gamma, S = ekf.update_gps(spoofed_gps.pos, spoofed_gps.vel)
-                    d_M2, _ = layer1.evaluate(gamma, S)
+                    gamma, S = ekf.update_gps(spoofed_gps)
+                    d_M2, _, _ = layer1.evaluate(gamma, S)
                 
                 # Active Probing Evaluation after twitch at t=36.0s
                 if t >= 36.0 and not is_attack_detected and is_probing:
@@ -123,29 +139,32 @@ def main():
             # 3. Stream Telemetry to QGroundControl
             bridge.send_heartbeat()
             
-            # Current estimated position (EKF) vs GPS position
-            ekf_state = ekf.get_state()
-            x_est = ekf_state[0]
-            y_est = ekf_state[1]
-            z_est = state.pos[2]
+            x_est = ekf.x[0]
+            y_est = ekf.x[1]
+            z_est = ekf.x[2]
+            
+            # Calculate heading (yaw)
+            speed = float(np.linalg.norm(true_vel[:2]))
+            yaw = float(math.atan2(true_vel[1], true_vel[0])) if speed > 0.1 else 0.0
+            roll = float(np.radians(15.0)) if 20.0 <= t <= 35.0 else 0.0
             
             # Send Global Position, Attitude & HUD to QGC
-            bridge.send_global_position(x_est, y_est, z_est, state.vel[0], state.vel[1], state.vel[2], state.yaw)
-            bridge.send_attitude(state.roll, state.pitch, state.yaw)
+            bridge.send_global_position(x_est, y_est, z_est, true_vel[0], true_vel[1], true_vel[2], yaw)
+            bridge.send_attitude(roll, 0.0, yaw)
             bridge.send_vfr_hud(
-                airspeed=float(np.linalg.norm(state.vel)),
-                groundspeed=float(np.linalg.norm(state.vel[:2])),
-                heading_deg=float(math.degrees(state.yaw)),
+                airspeed=float(np.linalg.norm(true_vel)),
+                groundspeed=speed,
+                heading_deg=float(math.degrees(yaw)),
                 altitude=float(bridge.origin_alt + z_est),
-                climb_rate=float(state.vel[2])
+                climb_rate=float(-true_vel[2])
             )
             
             # 4. Terminal Progress HUD
             if t - last_hud_print >= 1.0:
                 last_hud_print = t
                 status_str = "HEALTHY" if not is_spoofing else ("SPOOFED (Layer 1 Blind)" if not is_gps_rejected else "PROTECTED (IMU Dead-Reckoning)")
-                drift_m = np.linalg.norm(spoofed_gps.pos[:2] - state.pos[:2]) if is_spoofing else 0.0
-                print(f"⏱️ T={t:4.1f}s | Pos: ({x_est:6.1f}m, {y_est:6.1f}m) | Speed: {np.linalg.norm(state.vel):4.1f} m/s | Spoof Drift: {drift_m:4.1f}m | Status: [{status_str}]")
+                drift_m = np.linalg.norm(spoofed_gps.position[:2] - true_pos[:2]) if is_spoofing else 0.0
+                print(f"⏱️ T={t:4.1f}s | Pos: ({x_est:6.1f}m, {y_est:6.1f}m) | Speed: {speed:4.1f} m/s | Spoof Drift: {drift_m:4.1f}m | Status: [{status_str}]")
             
             # Synchronize to real-time (1x real-time pacing)
             elapsed = time.time() - loop_start
