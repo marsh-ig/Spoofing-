@@ -39,15 +39,31 @@ class QGCMavlinkBridge:
         return lat, lon
 
     def send_heartbeat(self):
-        """Sends MAVLink Heartbeat at 1 Hz (identifying as PX4 Fixed-Wing/Multirotor in Autonomous Mode)."""
+        """Sends MAVLink Heartbeat and SYS_STATUS at 1 Hz (identifying as PX4 in Autonomous Mode)."""
         now = time.time()
         if now - self.last_heartbeat >= 1.0:
+            # 1. Heartbeat
             self.mav.mav.heartbeat_send(
                 mavutil.mavlink.MAV_TYPE_FIXED_WING,
                 mavutil.mavlink.MAV_AUTOPILOT_PX4,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED,
                 0,
                 mavutil.mavlink.MAV_STATE_ACTIVE
+            )
+            # 2. System Status (Required by QGC to mark vehicle healthy and display battery/sensors)
+            sensors = (
+                mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_GYRO |
+                mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_ACCEL |
+                mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_MAG |
+                mavutil.mavlink.MAV_SYS_STATUS_SENSOR_ABSOLUTE_PRESSURE |
+                mavutil.mavlink.MAV_SYS_STATUS_SENSOR_GPS
+            )
+            self.mav.mav.sys_status_send(
+                sensors, sensors, sensors,
+                500,    # CPU load 50%
+                12400,  # Battery 12.4V (3S LiPo)
+                85,     # Battery remaining 85%
+                0, 0, 0, 0, 0, 0
             )
             self.last_heartbeat = now
 

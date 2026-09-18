@@ -148,8 +148,9 @@ def main():
             yaw = float(math.atan2(true_vel[1], true_vel[0])) if speed > 0.1 else 0.0
             roll = float(np.radians(15.0)) if 20.0 <= t <= 35.0 else 0.0
             
-            # Send Global Position, Attitude & HUD to QGC
+            # Send Global Position, Attitude, Raw GPS & HUD to QGC
             bridge.send_global_position(x_est, y_est, z_est, true_vel[0], true_vel[1], true_vel[2], yaw)
+            bridge.send_gps_raw(x_est, y_est, z_est, speed, yaw)
             bridge.send_attitude(roll, 0.0, yaw)
             bridge.send_vfr_hud(
                 airspeed=float(np.linalg.norm(true_vel)),
