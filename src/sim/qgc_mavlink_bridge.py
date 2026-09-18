@@ -2,6 +2,7 @@
 QGroundControl (QGC) MAVLink Telemetry Bridge
 Streams real-time UAV flight simulation, GPS spoofing attacks, and Active Probing Defense
 directly to QGroundControl via MAVLink over UDP (port 14550).
+Includes automatic QGC Handshake & Parameter Responder for instant vehicle discovery.
 """
 import time
 import math
@@ -32,25 +33,46 @@ class QGCMavlinkBridge:
 
     def xy_to_latlon(self, x_north: float, y_east: float):
         """Converts local NED coordinates (meters) to global WGS84 Lat/Lon."""
-        # 1 degree latitude ~ 111,139 meters
-        # 1 degree longitude ~ 111,139 * cos(lat) meters
         lat = self.origin_lat + (x_north / 111139.0)
         lon = self.origin_lon + (y_east / (111139.0 * math.cos(math.radians(self.origin_lat))))
         return lat, lon
 
+    def handle_incoming_requests(self):
+        """Responds to QGC parameter and command handshakes to immediately spawn the vehicle."""
+        while True:
+            msg = self.mav.recv_match(blocking=False)
+            if not msg:
+                break
+            mtype = msg.get_type()
+            if mtype in ['PARAM_REQUEST_LIST', 'PARAM_REQUEST_READ']:
+                # Send parameter value to complete QGC vehicle loading
+                param_id = b'SYS_AUTOSTART\x00\x00\x00'
+                self.mav.mav.param_value_send(
+                    param_id,
+                    4001.0,
+                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+                    1,
+                    0
+                )
+            elif mtype == 'COMMAND_LONG':
+                self.mav.mav.command_ack_send(
+                    msg.command,
+                    mavutil.mavlink.MAV_RESULT_ACCEPTED
+                )
+
     def send_heartbeat(self):
-        """Sends MAVLink Heartbeat and SYS_STATUS at 1 Hz (identifying as PX4 in Autonomous Mode)."""
+        """Sends MAVLink Heartbeat and SYS_STATUS at 1 Hz."""
         now = time.time()
-        if now - self.last_heartbeat >= 1.0:
-            # 1. Heartbeat
+        if now - self.last_heartbeat >= 0.5:
+            # 1. Heartbeat (Generic / PX4)
             self.mav.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_FIXED_WING,
-                mavutil.mavlink.MAV_AUTOPILOT_PX4,
+                mavutil.mavlink.MAV_TYPE_QUADROTOR,
+                mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED,
                 0,
                 mavutil.mavlink.MAV_STATE_ACTIVE
             )
-            # 2. System Status (Required by QGC to mark vehicle healthy and display battery/sensors)
+            # 2. System Status (Required by QGC to mark vehicle healthy)
             sensors = (
                 mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_GYRO |
                 mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_ACCEL |
@@ -62,11 +84,23 @@ class QGCMavlinkBridge:
                 sensors, sensors, sensors,
                 500,    # CPU load 50%
                 12400,  # Battery voltage 12.4V (in mV)
-                -1,     # Battery current (not measured: -1)
+                -1,     # Battery current (-1 not measured)
                 85,     # Battery remaining 85%
                 0, 0, 0, 0, 0, 0
             )
+            
+            # 3. Proactively send param value so QGC unlocks immediately
+            param_id = b'SYS_AUTOSTART\x00\x00\x00'
+            self.mav.mav.param_value_send(
+                param_id,
+                4001.0,
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+                1,
+                0
+            )
             self.last_heartbeat = now
+            
+        self.handle_incoming_requests()
 
     def send_attitude(self, roll_rad: float, pitch_rad: float, yaw_rad: float):
         """Sends aircraft attitude (roll, pitch, yaw) to drive QGC Artificial Horizon / Compass."""
@@ -99,7 +133,7 @@ class QGCMavlinkBridge:
         lat, lon = self.xy_to_latlon(x_north, y_east)
         hdg_cdeg = int((math.degrees(yaw_rad) % 360) * 100)
         self.mav.mav.gps_raw_int_send(
-            self.get_time_boot_ms() * 1000, # microsec
+            int(time.time() * 1e6),          # microsec
             3,                               # Fix type: 3D Fix
             int(lat * 1e7),
             int(lon * 1e7),
