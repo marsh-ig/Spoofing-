@@ -61,7 +61,8 @@ class QGCMavlinkBridge:
             self.mav.mav.sys_status_send(
                 sensors, sensors, sensors,
                 500,    # CPU load 50%
-                12400,  # Battery 12.4V (3S LiPo)
+                12400,  # Battery voltage 12.4V (in mV)
+                -1,     # Battery current (not measured: -1)
                 85,     # Battery remaining 85%
                 0, 0, 0, 0, 0, 0
             )
