@@ -133,7 +133,6 @@ def main():
                         is_attack_detected = True
                         is_gps_rejected = True
                         bridge.send_statustext(f"CRITICAL: GPS Spoofing Confirmed! (Peak={peak_corr:.2f}, Lag={lag*1000:.0f}ms)", mavutil.mavlink.MAV_SEVERITY_CRITICAL)
-                        bridge.send_statustext("EMERGENCY: GPS Rejected. Switched to IMU Dead-Reckoning.", mavutil.mavlink.MAV_SEVERITY_EMERGENCY)
                         print(f"\n🚨 [LAYER 3 ALARM TRIGGERED] {status} -> FAILOVER TO DEAD-RECKONING!\n")
             
             # 3. Stream Telemetry to QGroundControl
@@ -173,10 +172,15 @@ def main():
             if sleep_time > 0:
                 time.sleep(sleep_time)
                 
+        print("\n[+] Mission flight path complete. Maintaining active heartbeat connection...")
+        while True:
+            bridge.send_heartbeat()
+            time.sleep(0.5)
+            
     except KeyboardInterrupt:
         print("\n[!] Simulation stopped by user.")
     
-    print("\n[+] Simulation run complete! Telemetry successfully streamed to QGroundControl.")
+    print("\n[+] Telemetry stream stopped.")
 
 if __name__ == "__main__":
     main()
