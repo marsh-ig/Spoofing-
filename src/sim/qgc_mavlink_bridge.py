@@ -61,15 +61,19 @@ class QGCMavlinkBridge:
                 )
 
     def send_heartbeat(self):
-        """Sends MAVLink Heartbeat and SYS_STATUS at 1 Hz."""
+        """Sends MAVLink Heartbeat and SYS_STATUS at 1 Hz (identifying as PX4 in Position Control / Mission Mode)."""
         now = time.time()
         if now - self.last_heartbeat >= 0.5:
-            # 1. Heartbeat (Generic / PX4)
+            # PX4 custom_mode bitmask for "Position Control" / "Hold"
+            # main_mode = 3 (POSCTL), sub_mode = 0
+            px4_custom_mode = (3 << 16)
+            
+            # 1. Heartbeat (PX4 Autopilot)
             self.mav.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_QUADROTOR,
-                mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED,
-                0,
+                mavutil.mavlink.MAV_TYPE_FIXED_WING,
+                mavutil.mavlink.MAV_AUTOPILOT_PX4,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED | mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED,
+                px4_custom_mode,
                 mavutil.mavlink.MAV_STATE_ACTIVE
             )
             # 2. System Status (Required by QGC to mark vehicle healthy)
@@ -89,7 +93,17 @@ class QGCMavlinkBridge:
                 0, 0, 0, 0, 0, 0
             )
             
-            # 3. Proactively send param value so QGC unlocks immediately
+            # 3. Home Position
+            self.mav.mav.home_position_send(
+                int(self.origin_lat * 1e7),
+                int(self.origin_lon * 1e7),
+                int(self.origin_alt * 1000),
+                0.0, 0.0, 0.0,
+                [1.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 0.0
+            )
+            
+            # 4. Proactively send param value so QGC unlocks immediately
             param_id = b'SYS_AUTOSTART\x00\x00\x00'
             self.mav.mav.param_value_send(
                 param_id,
